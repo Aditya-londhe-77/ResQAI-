@@ -1,10 +1,10 @@
-import React, { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
-import { db, auth, storage } from '../firebase/config';
-import { collection, onSnapshot, query, where, doc, updateDoc, getDoc, getDocs } from 'firebase/firestore';
+import { db, storage } from '../firebase/config';
+import { collection, onSnapshot, query, where, doc } from 'firebase/firestore';
 import { getDownloadURL, ref, uploadBytes } from 'firebase/storage';
-import { MapPin, FileText, Heart, Users, Package, ClipboardList, CheckCircle2, AlertTriangle, HandHelping, Locate } from 'lucide-react';
+import { MapPin, FileText, Heart, Users, Package, ClipboardList, CheckCircle2, HandHelping, Locate } from 'lucide-react';
 import Navbar from '../components/Navbar';
 import TabBar from '../components/TabBar';
 import MapView from '../components/Map';
@@ -12,9 +12,64 @@ import Modal from '../components/Modal';
 import SeverityBar from '../components/SeverityBar';
 import FloatingAlert from '../components/FloatingAlert';
 import DonationForm from '../components/DonationForm';
-import { submitCitizenReport, assignNGOToIncident, markSituationUnderControl, assignTask, markTaskComplete, updateInventory, createDonation, registerCitizenAsVolunteer, updateUserLocation, joinVolunteerToNGO, leaveVolunteerNGO, saveAIIncidentsToFirestore } from '../firebase/firestoreHelpers';
+import { submitCitizenReport, assignNGOToIncident, markSituationUnderControl, assignTask, markTaskComplete, updateInventory, createDonation, registerCitizenAsVolunteer, updateUserLocation, joinVolunteerToNGO, leaveVolunteerNGO } from '../firebase/firestoreHelpers';
 import { analyzeIncidentPhoto, verifyIncidentEvidence } from '../services/incidentVision';
-import { runCrisisScanner } from '../services/crisisScanner';
+
+const normalizeCoords = (value) => {
+  if (!value) return null;
+
+  const directLat = Number(value.lat ?? value.latitude);
+  const directLng = Number(value.lng ?? value.longitude ?? value.lon);
+  if (Number.isFinite(directLat) && Number.isFinite(directLng)) {
+    return { lat: directLat, lng: directLng };
+  }
+
+  const nested = value.location || value.geo || value.coords;
+  if (!nested) return null;
+
+  const nestedLat = Number(nested.lat ?? nested.latitude);
+  const nestedLng = Number(nested.lng ?? nested.longitude ?? nested.lon);
+  if (Number.isFinite(nestedLat) && Number.isFinite(nestedLng)) {
+    return { lat: nestedLat, lng: nestedLng };
+  }
+
+  return null;
+};
+
+const toRadians = (deg) => (deg * Math.PI) / 180;
+
+const distanceKm = (from, to) => {
+  const source = normalizeCoords(from);
+  const target = normalizeCoords(to);
+  if (!source || !target) return null;
+
+  const earthRadiusKm = 6371;
+  const dLat = toRadians(target.lat - source.lat);
+  const dLng = toRadians(target.lng - source.lng);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRadians(source.lat)) * Math.cos(toRadians(target.lat)) *
+    Math.sin(dLng / 2) * Math.sin(dLng / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return earthRadiusKm * c;
+};
+
+const estimateEtaFromDistanceKm = (km) => {
+  if (!Number.isFinite(km) || km < 0) return null;
+
+  // Rough estimate only: includes dispatch prep plus average on-road speed.
+  const averageSpeedKmh = 32;
+  const dispatchBufferMinutes = 8;
+  const minutes = Math.max(6, Math.round((km / averageSpeedKmh) * 60 + dispatchBufferMinutes));
+
+  if (minutes >= 60) {
+    const hours = Math.floor(minutes / 60);
+    const remainder = minutes % 60;
+    return remainder === 0 ? `${hours}h` : `${hours}h ${remainder}m`;
+  }
+
+  return `${minutes} min`;
+};
 
 export default function Dashboard() {
   const { user, userData, loading: authLoading } = useAuth();
@@ -45,13 +100,6 @@ export default function Dashboard() {
   const [joiningNgoId, setJoiningNgoId] = useState('');
   const [taskError, setTaskError] = useState('');
   const [taskSubmitting, setTaskSubmitting] = useState(false);
-
-  // AI Crisis Scanner
-  const [scanLoading, setScanLoading] = useState(false);
-  const [scanError, setScanError] = useState('');
-  const [scanLog, setScanLog] = useState([]);
-  const [scanDone, setScanDone] = useState(false);
-  const [savedCount, setSavedCount] = useState(0);
   const lastSevereAlertKeyRef = useRef('');
 
   const getModelSeverity = useCallback((incident) => {
@@ -187,11 +235,11 @@ export default function Dashboard() {
 
   // NGO directory for volunteers
   useEffect(() => {
-    if (role !== 'volunteer') return;
+    if (!user) return;
     const q = query(collection(db, 'users'), where('role', '==', 'ngo'));
     const unsub = onSnapshot(q, (snap) => setNgos(snap.docs.map(d => ({ id: d.id, ...d.data() }))));
     return () => unsub();
-  }, [role]);
+  }, [user]);
 
   // Volunteer profile with NGO membership
   useEffect(() => {
@@ -212,13 +260,16 @@ export default function Dashboard() {
 
   // Sync inventory from userData
   useEffect(() => {
-    if (userData?.inventory) setInventory(userData.inventory);
+    if (!userData?.inventory) return;
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setInventory(userData.inventory);
   }, [userData]);
 
   useEffect(() => {
     if (role !== 'ngo') return;
     const lat = userData?.location?.lat ?? userData?.lat ?? '';
     const lng = userData?.location?.lng ?? userData?.lng ?? '';
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setManualNgoCoords({ lat: String(lat), lng: String(lng) });
   }, [role, userData]);
 
@@ -433,42 +484,6 @@ export default function Dashboard() {
     setNgoLocationSaving(false);
   };
 
-  const handleAIScan = useCallback(async () => {
-    if (scanLoading) return;
-    setScanLoading(true);
-    setScanError('');
-    setScanLog([]);
-    setScanDone(false);
-    setSavedCount(0);
-
-    try {
-      const results = await runCrisisScanner((msg) =>
-        setScanLog((prev) => [...prev, msg])
-      );
-
-      setScanLog((prev) => [...prev, `💾 Saving ${results.length} reports to Firestore...`]);
-      const saved = await saveAIIncidentsToFirestore(results);
-      setSavedCount(saved.length);
-
-      if (saved.length === 0) {
-        setScanLog((prev) => [...prev, '⚠️ All reports already saved from a previous scan.']);
-      } else {
-        setScanLog((prev) => [...prev, `✅ ${saved.length} new crisis reports saved! They are now live on the map.`]);
-        setFloatingAlert(`🤖 AI Scan complete — ${saved.length} new crisis reports added to the map!`);
-      }
-      setScanDone(true);
-    } catch (err) {
-      const msg = String(err?.message || err);
-      setScanError(
-        msg.includes('503') || msg.includes('UNAVAILABLE') || msg.includes('overloaded')
-          ? 'Gemini API is currently overloaded. Please wait a minute and try again.'
-          : msg
-      );
-    } finally {
-      setScanLoading(false);
-    }
-  }, [scanLoading]);
-
   if (authLoading || !userData) return (
     <div className="app-layout" style={{ justifyContent: 'center', alignItems: 'center' }}>
       <span className="spinner" style={{ width: 32, height: 32, borderWidth: 3 }} />
@@ -476,8 +491,37 @@ export default function Dashboard() {
   );
 
   const myAssigned = incidents.filter(i => i.assignedNGOs?.includes(user.uid));
+  const ngoById = ngos.reduce((acc, ngo) => {
+    acc[ngo.id] = ngo;
+    return acc;
+  }, {});
+
+  const getIncidentEtaLabel = (incident) => {
+    const assignedNgoIds = Array.isArray(incident?.assignedNGOs) ? incident.assignedNGOs : [];
+    if (assignedNgoIds.length === 0) return null;
+
+    const incidentCoords = normalizeCoords(incident?.location || incident);
+    if (!incidentCoords) return null;
+
+    // For NGO users, prioritize own ETA when assigned.
+    if (role === 'ngo' && user?.uid && assignedNgoIds.includes(user.uid)) {
+      const selfCoords = normalizeCoords(userData?.location || userData);
+      const selfDistance = distanceKm(selfCoords, incidentCoords);
+      const selfEta = estimateEtaFromDistanceKm(selfDistance);
+      if (selfEta) return selfEta;
+    }
+
+    const nearestDistance = assignedNgoIds.reduce((minDistance, ngoId) => {
+      const ngoCoords = normalizeCoords(ngoById[ngoId]);
+      const km = distanceKm(ngoCoords, incidentCoords);
+      if (!Number.isFinite(km)) return minDistance;
+      return minDistance == null || km < minDistance ? km : minDistance;
+    }, null);
+
+    return estimateEtaFromDistanceKm(nearestDistance);
+  };
+
   const aiIncidents = incidents.filter(i => i.aiGenerated === true);
-  const citizenIncidents = incidents.filter(i => !i.aiGenerated);
   const sortedIncidents = [...incidents].sort((a, b) => getModelSeverity(b) - getModelSeverity(a));
 
   // Tab configs per role
@@ -519,16 +563,16 @@ export default function Dashboard() {
 
               {role === 'citizen' && (
                 <div className="card fade-in">
-                  <h4 style={{ fontSize: '0.9rem', marginBottom: '0.5rem' }}>📍 Report Emergency</h4>
+                  <h4 style={{ fontFamily: 'var(--font-serif)',  fontSize: '0.9rem', marginBottom: '0.5rem' }}>📍 Report Emergency</h4>
                   <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)', marginBottom: '0.75rem' }}>Click anywhere on the map to pin a disaster location.</p>
                 </div>
               )}
 
               <div className="card fade-in" style={{ flex: 1, overflowY: 'auto' }}>
-                <h4 style={{ fontSize: '0.9rem', marginBottom: '0.55rem' }}>
+                <h4 style={{ fontFamily: 'var(--font-serif)',  fontSize: '0.9rem', marginBottom: '0.55rem' }}>
                   Live Incidents ({sortedIncidents.length})
                   {aiIncidents.length > 0 && (
-                    <span style={{ marginLeft: 8, fontSize: '0.7rem', background: 'rgba(124,58,237,0.12)', color: '#7C3AED', borderRadius: 4, padding: '1px 6px', fontWeight: 600 }}>
+                    <span style={{ marginLeft: 8, fontSize: '0.7rem', background: 'var(--primary-light)', color: 'var(--primary)', borderRadius: 4, padding: '1px 6px', fontWeight: 600 }}>
                       🤖 {aiIncidents.length} AI
                     </span>
                   )}
@@ -539,24 +583,25 @@ export default function Dashboard() {
                     (() => {
                       const severity = getModelSeverity(inc);
                       const helpStatus = getIncidentHelpStatus(inc);
+                      const etaLabel = getIncidentEtaLabel(inc);
                       return (
                       <div
                         key={inc.id}
                         className={`incident-item ${inc.severityScore === 0 ? 'resolved' : ''}`}
                         style={{
                           borderLeftColor: inc.aiGenerated
-                            ? (severity > 75 ? '#7C3AED' : '#8B5CF6')
-                            : (severity > 75 ? 'var(--severity-critical)' : severity > 40 ? 'var(--severity-medium)' : 'var(--severity-low)'),
-                          background: inc.aiGenerated ? 'rgba(124,58,237,0.04)' : undefined,
+                            ? (severity > 75 ? 'var(--primary)' : 'var(--primary)')
+                            : (severity > 75 ? 'var(--danger)' : severity > 40 ? 'var(--warning)' : 'var(--success)'),
+                          background: inc.aiGenerated ? 'var(--bg-hover)' : undefined,
                         }}
                       >
                         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 2 }}>
                           <strong style={{ fontSize: '0.8rem', lineHeight: 1.3, flex: 1 }}>{inc.title}</strong>
-                          <span style={{ fontSize: '0.7rem', color: inc.aiGenerated ? '#7C3AED' : severity > 75 ? 'var(--severity-critical)' : 'var(--text-muted)', fontWeight: 700, marginLeft: 4 }}>{severity}%</span>
+                          <span style={{ fontSize: '0.7rem', color: inc.aiGenerated ? 'var(--primary)' : severity > 75 ? 'var(--danger)' : 'var(--text-muted)', fontWeight: 700, marginLeft: 4 }}>{severity}%</span>
                         </div>
 
                         {inc.aiGenerated && (
-                          <span style={{ fontSize: '0.62rem', background: '#7C3AED', color: '#fff', borderRadius: 3, padding: '1px 5px', fontWeight: 700, display: 'inline-block', marginBottom: 4 }}>🤖 AI</span>
+                          <span style={{ fontSize: '0.62rem', background: 'var(--primary)', color: 'var(--text-light)', borderRadius: 3, padding: '1px 5px', fontWeight: 700, display: 'inline-block', marginBottom: 4 }}>🤖 AI</span>
                         )}
 
                         <SeverityBar value={severity} />
@@ -567,10 +612,15 @@ export default function Dashboard() {
                         <div style={{ fontSize: '0.7rem', color: helpStatus.color, fontWeight: 700, marginTop: 3 }}>
                           🚑 {helpStatus.label}
                         </div>
+                        {inc.assignedNGOs?.length > 0 && etaLabel && (
+                          <div style={{ fontSize: '0.68rem', color: 'var(--text-muted)', marginTop: 2 }}>
+                            🕒 Predicted ETA: ~{etaLabel}
+                          </div>
+                        )}
 
                         {/* AI-specific quick stats */}
                         {inc.aiGenerated && (inc.confirmedDeaths > 0 || inc.awaitingRescue > 0 || inc.totalAffected > 0) && (
-                          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '2px 8px', marginTop: 5, fontSize: '0.67rem', color: '#475569' }}>
+                          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '2px 8px', marginTop: 5, fontSize: '0.67rem', color: 'var(--text-muted)' }}>
                             {inc.confirmedDeaths > 0 && <><span>💀 Deaths</span><span style={{ fontWeight: 600 }}>{inc.confirmedDeaths.toLocaleString('en-IN')}</span></>}
                             {inc.awaitingRescue > 0 && <><span>🔴 Awaiting</span><span style={{ fontWeight: 600 }}>{inc.awaitingRescue.toLocaleString('en-IN')}</span></>}
                             {inc.totalAffected > 0 && <><span>👥 Affected</span><span style={{ fontWeight: 600 }}>{inc.totalAffected.toLocaleString('en-IN')}</span></>}
@@ -580,7 +630,7 @@ export default function Dashboard() {
 
                         {/* AI logistics summary */}
                         {inc.aiGenerated && inc.logistics && (inc.logistics.foodPackets > 0 || inc.logistics.medicalKits > 0) && (
-                          <div style={{ marginTop: 4, fontSize: '0.66rem', color: '#64748B' }}>
+                          <div style={{ marginTop: 4, fontSize: '0.66rem', color: 'var(--text-muted)' }}>
                             🍱 {inc.logistics.foodPackets?.toLocaleString('en-IN')} food • 🏥 {inc.logistics.medicalKits?.toLocaleString('en-IN')} kits
                           </div>
                         )}
@@ -596,7 +646,7 @@ export default function Dashboard() {
               </div>
             </aside>
             <section className="dashboard-map-main">
-              <MapView incidents={incidents} onMapClick={handleMapClick} interactive={role === 'citizen'} userPosition={userPosition} onLocate={locateUser} />
+              <MapView incidents={incidents} ngos={ngos} onMapClick={handleMapClick} interactive={role === 'citizen'} userPosition={userPosition} onLocate={locateUser} />
             </section>
           </div>
         )}
@@ -604,7 +654,7 @@ export default function Dashboard() {
         {/* ===== CITIZEN: MY REPORTS ===== */}
         {activeTab === 'reports' && role === 'citizen' && (
           <div className="fade-in" style={{ maxWidth: 700, margin: '0 auto', width: '100%' }}>
-            <h3 style={{ marginBottom: '1rem' }}>My Reports ({myReports.length})</h3>
+            <h3 style={{ fontFamily: 'var(--font-serif)',  marginBottom: '1rem' }}>My Reports ({myReports.length})</h3>
             {myReports.length === 0 && <div className="empty-state"><FileText size={40} /><p>No reports yet. Click on the map to report an incident.</p></div>}
             <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
               {myReports.map(r => (
@@ -625,7 +675,7 @@ export default function Dashboard() {
           <div className="fade-in" style={{ maxWidth: 480, margin: '0 auto', width: '100%' }}>
             <div className="card" style={{ padding: '2rem', textAlign: 'center' }}>
               <HandHelping size={48} color="var(--primary)" style={{ marginBottom: '1rem' }} />
-              <h3 style={{ marginBottom: '0.5rem' }}>Become a Volunteer</h3>
+              <h3 style={{ fontFamily: 'var(--font-serif)',  marginBottom: '0.5rem' }}>Become a Volunteer</h3>
               <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem', marginBottom: '1.5rem' }}>Help communities in crisis by joining as a volunteer.</p>
               <form onSubmit={async (e) => { e.preventDefault(); await registerCitizenAsVolunteer(user.uid, new FormData(e.target).get('skills')); window.location.reload(); }}>
                 <div className="input-group">
@@ -641,7 +691,7 @@ export default function Dashboard() {
         {/* ===== NGO: INVENTORY ===== */}
         {activeTab === 'inventory' && role === 'ngo' && (
           <div className="fade-in" style={{ maxWidth: 600, margin: '0 auto', width: '100%' }}>
-            <h3 style={{ marginBottom: '1rem' }}>📦 Resource Inventory</h3>
+            <h3 style={{ fontFamily: 'var(--font-serif)',  marginBottom: '1rem' }}>📦 Resource Inventory</h3>
             <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
               {['food', 'clothes', 'supplies', 'medical'].map(field => (
                 <div key={field} className="inv-control">
@@ -653,7 +703,7 @@ export default function Dashboard() {
               ))}
             </div>
             <div className="card" style={{ marginTop: '1rem', padding: '1rem' }}>
-              <h4 style={{ marginBottom: '0.5rem', fontSize: '0.9rem' }}>📍 Operational Location</h4>
+              <h4 style={{ fontFamily: 'var(--font-serif)',  marginBottom: '0.5rem', fontSize: '0.9rem' }}>📍 Operational Location</h4>
               <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginBottom: '0.75rem' }}>
                 Keep this updated so admins can assign incidents to nearest NGOs.
               </p>
@@ -689,7 +739,7 @@ export default function Dashboard() {
         {activeTab === 'volunteers' && role === 'ngo' && (
           <div className="fade-in" style={{ maxWidth: 700, margin: '0 auto', width: '100%' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
-              <h3>👥 Volunteers ({volunteers.length})</h3>
+              <h3 style={{ fontFamily: 'var(--font-serif)' }}>👥 Volunteers ({volunteers.length})</h3>
               <button className="btn btn-primary btn-sm" onClick={() => { setTaskError(''); setShowTaskModal(true); }}>+ Assign Task</button>
             </div>
             {volunteers.length === 0 && <div className="empty-state"><Users size={40} /><p>No volunteers registered yet. Volunteers must join your NGO first.</p></div>}
@@ -723,17 +773,26 @@ export default function Dashboard() {
         {/* ===== NGO: ASSIGNMENTS ===== */}
         {activeTab === 'assignments' && role === 'ngo' && (
           <div className="fade-in" style={{ maxWidth: 700, margin: '0 auto', width: '100%' }}>
-            <h3 style={{ marginBottom: '1rem' }}>📋 My Assigned Incidents ({myAssigned.length})</h3>
+            <h3 style={{ fontFamily: 'var(--font-serif)',  marginBottom: '1rem' }}>📋 My Assigned Incidents ({myAssigned.length})</h3>
             {myAssigned.length === 0 && <div className="empty-state"><ClipboardList size={40} /><p>No assignments yet. Self-assign from the Map tab.</p></div>}
             <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
               {myAssigned.map(inc => (
                 <div key={inc.id} className="card" style={{ padding: '1rem' }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
                     <strong>{inc.title}</strong>
-                    <span style={{ fontSize: '0.78rem', fontWeight: 600, color: inc.severityScore > 50 ? 'var(--severity-critical)' : 'var(--severity-low)' }}>{inc.severityScore}%</span>
+                    <span style={{ fontSize: '0.78rem', fontWeight: 600, color: inc.severityScore > 50 ? 'var(--danger)' : 'var(--success)' }}>{inc.severityScore}%</span>
                   </div>
                   <SeverityBar value={inc.severityScore} />
                   <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)', margin: '6px 0' }}>{inc.disasterType} • {inc.reportCount} reports • {inc.assignedNGOs?.length || 0} NGOs</div>
+                  {(() => {
+                    const etaLabel = getIncidentEtaLabel(inc);
+                    if (!etaLabel) return null;
+                    return (
+                      <div style={{ fontSize: '0.76rem', color: 'var(--text-muted)', marginBottom: 8 }}>
+                        🕒 Predicted arrival: ~{etaLabel}
+                      </div>
+                    );
+                  })()}
                   {!inc.resolvedNGOs?.includes(user.uid) ? (
                     <button className="btn btn-success btn-sm w-full" onClick={() => handleResolve(inc)}>
                       <CheckCircle2 size={14} /> Mark Situation Under Control
@@ -750,7 +809,7 @@ export default function Dashboard() {
         {/* ===== VOLUNTEER: MY TASKS ===== */}
         {activeTab === 'tasks' && role === 'volunteer' && (
           <div className="fade-in" style={{ maxWidth: 700, margin: '0 auto', width: '100%' }}>
-            <h3 style={{ marginBottom: '1rem' }}>📋 My Tasks ({tasks.length})</h3>
+            <h3 style={{ fontFamily: 'var(--font-serif)',  marginBottom: '1rem' }}>📋 My Tasks ({tasks.length})</h3>
             {tasks.length === 0 && <div className="empty-state"><ClipboardList size={40} /><p>No tasks assigned yet. Your NGO will assign tasks when needed.</p></div>}
             <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
               {tasks.map(t => (
@@ -774,7 +833,7 @@ export default function Dashboard() {
         {activeTab === 'ngo' && role === 'volunteer' && (
           <div className="fade-in" style={{ maxWidth: 760, margin: '0 auto', width: '100%' }}>
             <div className="card" style={{ padding: '1rem', marginBottom: '0.9rem' }}>
-              <h3 style={{ marginBottom: '0.4rem' }}>🏢 NGO Membership</h3>
+              <h3 style={{ fontFamily: 'var(--font-serif)',  marginBottom: '0.4rem' }}>🏢 NGO Membership</h3>
               {volunteerProfile?.joinedNgoId ? (
                 <>
                   <p style={{ fontSize: '0.82rem', color: 'var(--text-muted)', marginBottom: '0.7rem' }}>
@@ -791,7 +850,7 @@ export default function Dashboard() {
               )}
             </div>
 
-            <h4 style={{ marginBottom: '0.75rem', fontSize: '0.9rem' }}>Available NGOs ({ngos.length})</h4>
+            <h4 style={{ fontFamily: 'var(--font-serif)',  marginBottom: '0.75rem', fontSize: '0.9rem' }}>Available NGOs ({ngos.length})</h4>
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: '0.75rem' }}>
               {ngos.map((ngo) => {
                 const isCurrent = volunteerProfile?.joinedNgoId === ngo.id;
@@ -825,7 +884,7 @@ export default function Dashboard() {
         {activeTab === 'donate' && (
           <div className="fade-in" style={{ maxWidth: 480, margin: '0 auto', width: '100%' }}>
             <div className="card" style={{ padding: '1.5rem' }}>
-              <h3 style={{ marginBottom: '1rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}><Heart size={20} color="var(--danger)" /> Donate for Relief</h3>
+              <h3 style={{ fontFamily: 'var(--font-serif)',  marginBottom: '1rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}><Heart size={20} color="var(--danger)" /> Donate for Relief</h3>
               <DonationForm incidents={incidents} onDonate={handleDonate} />
             </div>
           </div>
@@ -851,7 +910,7 @@ export default function Dashboard() {
           }}
         >
           {reportError && (
-            <div style={{ background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.25)', color: 'var(--danger)', borderRadius: 'var(--radius-sm)', padding: '0.55rem 0.7rem', fontSize: '0.76rem', marginBottom: '0.75rem' }}>
+            <div style={{ background: 'rgba(239,68,68,0.1)', border: '1px solid var(--danger)', color: 'var(--danger)', borderRadius: 'var(--radius-sm)', padding: '0.55rem 0.7rem', fontSize: '0.76rem', marginBottom: '0.75rem' }}>
               {reportError}
             </div>
           )}
@@ -939,7 +998,7 @@ export default function Dashboard() {
       >
         <form onSubmit={handleAssignTask}>
           {taskError && (
-            <div style={{ background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.25)', color: 'var(--danger)', borderRadius: 'var(--radius-sm)', padding: '0.5rem 0.7rem', fontSize: '0.75rem', marginBottom: '0.75rem' }}>
+            <div style={{ background: 'var(--danger-light)', border: '1px solid var(--danger)', color: 'var(--danger)', borderRadius: 'var(--radius-sm)', padding: '0.5rem 0.7rem', fontSize: '0.75rem', marginBottom: '0.75rem' }}>
               ⚠️ {taskError}
             </div>
           )}
@@ -1003,7 +1062,7 @@ export default function Dashboard() {
               style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6 }}
             >
               {taskSubmitting
-                ? <><span className="spinner" style={{ width: 12, height: 12, borderWidth: 2, borderColor: '#fff', borderTopColor: 'transparent' }} /> Assigning...</>
+                ? <><span className="spinner" style={{ width: 12, height: 12, borderWidth: 2, borderColor: 'var(--text-light)', borderTopColor: 'transparent' }} /> Assigning...</>
                 : 'Assign Task'}
             </button>
           </div>

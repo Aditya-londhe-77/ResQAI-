@@ -1,4 +1,3 @@
-import React from 'react';
 import { ShieldCheck } from 'lucide-react';
 
 export default function TabBar({ tabs, activeTab, onTabChange }) {

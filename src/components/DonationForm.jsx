@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import { useState } from 'react';
 import { Heart, CheckCircle } from 'lucide-react';
 
 const presets = [100, 500, 1000, 2000, 5000, 10000];

@@ -1,8 +1,38 @@
 import { db } from './config';
 import {
   collection, addDoc, updateDoc, doc, arrayUnion, serverTimestamp,
-  query, where, getDocs, getDoc, setDoc
+  query, where, getDocs, getDoc
 } from 'firebase/firestore';
+
+function stableHash(input = '') {
+  let hash = 0;
+  const text = String(input);
+  for (let i = 0; i < text.length; i += 1) {
+    hash = (hash * 31 + text.charCodeAt(i)) >>> 0;
+  }
+  return hash;
+}
+
+function deriveNgoInventory(ngo, index = 0, total = 1) {
+  const seed = stableHash(`${ngo?.id || ''}|${ngo?.name || ''}|${ngo?.city || ''}|${index}|${total}`);
+  const volunteerCount = Array.isArray(ngo?.volunteers) ? ngo.volunteers.length : Number(ngo?.volunteerCount) || 0;
+  const donationCount = Number(ngo?.donationCount) || 0;
+  const locationBoost = Number.isFinite(Number(ngo?.location?.lat)) && Number.isFinite(Number(ngo?.location?.lng)) ? 6 : 0;
+
+  const baseStock = 28
+    + (seed % 18)
+    + Math.min(18, volunteerCount * 2)
+    + Math.min(10, donationCount * 2)
+    + locationBoost;
+
+  const spread = (seed % 11) + (index % 5);
+  const food = Math.max(12, Math.round(baseStock * 1.22 + spread));
+  const clothes = Math.max(10, Math.round(baseStock * 1.01 + ((seed >> 2) % 8)));
+  const supplies = Math.max(14, Math.round(baseStock * 1.16 + ((seed >> 4) % 10)));
+  const medical = Math.max(8, Math.round(baseStock * 0.78 + Math.max(2, Math.ceil(volunteerCount * 1.5)) + ((seed >> 6) % 5)));
+
+  return { food, clothes, supplies, medical };
+}
 
 const DISASTER_BASE_SEVERITY = {
   Flood: 35,
@@ -231,21 +261,20 @@ function scoreNgoForIncident(incident, ngo) {
   const demandEntries = Object.entries(demand).filter(([, needed]) => needed > 0);
   const hasDemandData = demandEntries.length > 0;
 
-  let resourceFit = 0;
-  if (hasDemandData) {
+  const resourceFit = hasDemandData ? (() => {
     const totalDemand = demandEntries.reduce((sum, [, needed]) => sum + needed, 0);
     const fulfilled = demandEntries.reduce((sum, [field, needed]) => {
       const available = Math.max(0, Number(ngoInventory[field]) || 0);
       return sum + Math.min(available, needed);
     }, 0);
-    resourceFit = clamp(totalDemand > 0 ? fulfilled / totalDemand : 0, 0, 1);
-  } else {
+    return clamp(totalDemand > 0 ? fulfilled / totalDemand : 0, 0, 1);
+  })() : (() => {
     const totalInventory = ['food', 'clothes', 'supplies', 'medical'].reduce(
       (sum, field) => sum + Math.max(0, Number(ngoInventory[field]) || 0),
       0
     );
-    resourceFit = clamp(totalInventory / 800, 0, 1);
-  }
+    return clamp(totalInventory / 800, 0, 1);
+  })();
 
   const distance = haversineDistanceKm(incident?.location || incident, ngo);
   const distanceScore = distance == null ? 0.25 : clamp(1 - distance / 250, 0, 1);
@@ -372,6 +401,19 @@ export async function updateInventory(userId, field, value) {
   await updateDoc(ref, { [`inventory.${field}`]: Math.max(0, value) });
 }
 
+export async function assignLogicalInventoriesToNgos(ngos = []) {
+  const list = Array.isArray(ngos) ? ngos.filter((ngo) => ngo?.id) : [];
+  if (list.length === 0) return [];
+
+  const allocations = list.map((ngo, index) => ({
+    ngoId: ngo.id,
+    inventory: deriveNgoInventory(ngo, index, list.length),
+  }));
+
+  await Promise.all(allocations.map(({ ngoId, inventory }) => updateDoc(doc(db, 'users', ngoId), { inventory })));
+  return allocations;
+}
+
 export async function updateUserLocation(userId, location) {
   const ref = doc(db, 'users', userId);
   await updateDoc(ref, {
@@ -444,7 +486,8 @@ export async function saveAIIncidentsToFirestore(aiIncidents) {
     if (existingTitles.has(titleKey)) continue;
 
     // Strip the temporary client-side id before writing
-    const { _clientId, ...firestoreData } = incident;
+    const firestoreData = { ...incident };
+    delete firestoreData._clientId;
 
     const ref = await addDoc(collection(db, 'incidents'), {
       ...firestoreData,

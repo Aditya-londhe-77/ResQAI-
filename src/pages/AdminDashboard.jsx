@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react';
+import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
 import { db } from '../firebase/config';
@@ -12,6 +12,45 @@ import FloatingAlert from '../components/FloatingAlert';
 import StatCard from '../components/StatCard';
 import { assignNGOToIncident, autoAssignNGOsForIncidentModel, saveAIIncidentsToFirestore } from '../firebase/firestoreHelpers';
 import { runCrisisScanner } from '../services/crisisScanner';
+
+const normalizeCoords = (value) => {
+  if (!value) return null;
+
+  const directLat = Number(value.lat ?? value.latitude);
+  const directLng = Number(value.lng ?? value.longitude ?? value.lon);
+  if (Number.isFinite(directLat) && Number.isFinite(directLng)) {
+    return { lat: directLat, lng: directLng };
+  }
+
+  const nested = value.location || value.geo || value.coords;
+  if (nested) {
+    const nestedLat = Number(nested.lat ?? nested.latitude);
+    const nestedLng = Number(nested.lng ?? nested.longitude ?? nested.lon);
+    if (Number.isFinite(nestedLat) && Number.isFinite(nestedLng)) {
+      return { lat: nestedLat, lng: nestedLng };
+    }
+  }
+
+  return null;
+};
+
+const toRadians = (deg) => (deg * Math.PI) / 180;
+
+const distanceKm = (from, to) => {
+  const source = normalizeCoords(from);
+  const target = normalizeCoords(to);
+  if (!source || !target) return null;
+
+  const earthRadiusKm = 6371;
+  const dLat = toRadians(target.lat - source.lat);
+  const dLng = toRadians(target.lng - source.lng);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRadians(source.lat)) * Math.cos(toRadians(target.lat)) *
+    Math.sin(dLng / 2) * Math.sin(dLng / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return earthRadiusKm * c;
+};
 
 export default function AdminDashboard() {
   const { user, userData, loading: authLoading } = useAuth();
@@ -58,42 +97,38 @@ export default function AdminDashboard() {
     return { label: 'Awaiting NGO assignment', color: 'var(--danger)' };
   };
 
-  const normalizeCoords = (value) => {
-    if (!value) return null;
+  const estimateEtaFromDistanceKm = (km) => {
+    if (!Number.isFinite(km) || km < 0) return null;
 
-    const directLat = Number(value.lat ?? value.latitude);
-    const directLng = Number(value.lng ?? value.longitude ?? value.lon);
-    if (Number.isFinite(directLat) && Number.isFinite(directLng)) {
-      return { lat: directLat, lng: directLng };
+    // Rough forecast, intentionally approximate.
+    const averageSpeedKmh = 34;
+    const dispatchBufferMinutes = 8;
+    const minutes = Math.max(6, Math.round((km / averageSpeedKmh) * 60 + dispatchBufferMinutes));
+
+    if (minutes >= 60) {
+      const hours = Math.floor(minutes / 60);
+      const remainder = minutes % 60;
+      return remainder === 0 ? `${hours}h` : `${hours}h ${remainder}m`;
     }
 
-    const nested = value.location || value.geo || value.coords;
-    if (nested) {
-      const nestedLat = Number(nested.lat ?? nested.latitude);
-      const nestedLng = Number(nested.lng ?? nested.longitude ?? nested.lon);
-      if (Number.isFinite(nestedLat) && Number.isFinite(nestedLng)) {
-        return { lat: nestedLat, lng: nestedLng };
-      }
-    }
-
-    return null;
+    return `${minutes} min`;
   };
 
-  const toRadians = (deg) => (deg * Math.PI) / 180;
-  const distanceKm = (from, to) => {
-    const source = normalizeCoords(from);
-    const target = normalizeCoords(to);
-    if (!source || !target) return null;
+  const getIncidentEtaLabel = (incident) => {
+    const assignedNgoIds = Array.isArray(incident?.assignedNGOs) ? incident.assignedNGOs : [];
+    if (assignedNgoIds.length === 0) return null;
 
-    const earthRadiusKm = 6371;
-    const dLat = toRadians(target.lat - source.lat);
-    const dLng = toRadians(target.lng - source.lng);
-    const a =
-      Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-      Math.cos(toRadians(source.lat)) * Math.cos(toRadians(target.lat)) *
-      Math.sin(dLng / 2) * Math.sin(dLng / 2);
-    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-    return earthRadiusKm * c;
+    const incidentCoords = normalizeCoords(incident?.location || incident);
+    if (!incidentCoords) return null;
+
+    const nearestDistance = assignedNgoIds.reduce((minDistance, ngoId) => {
+      const ngo = ngos.find((item) => item.id === ngoId);
+      const km = distanceKm(ngo, incidentCoords);
+      if (!Number.isFinite(km)) return minDistance;
+      return minDistance == null || km < minDistance ? km : minDistance;
+    }, null);
+
+    return estimateEtaFromDistanceKm(nearestDistance);
   };
 
   useEffect(() => {
@@ -328,13 +363,13 @@ export default function AdminDashboard() {
           <div className="fade-in">
             <div className="grid-4" style={{ marginBottom: '1.5rem' }}>
               <StatCard icon={<AlertCircle size={36} />} value={incidents.length} label="Total Incidents" />
-              <StatCard icon={<AlertCircle size={36} />} value={activeIncidents.length} label="Active Crises" color="#EF4444" />
+              <StatCard icon={<AlertCircle size={36} />} value={activeIncidents.length} label="Active Crises" color="var(--danger)" />
               <StatCard icon={<Shield size={36} />} value={ngos.length} label="Registered NGOs" />
               <StatCard icon={<Users size={36} />} value={allVolunteers.length} label="Volunteers" />
             </div>
             <div className="grid-3">
-              <StatCard icon={<BarChart3 size={36} />} value={resolvedIncidents.length} label="Resolved" color="#10B981" />
-              <StatCard icon={<Package size={36} />} value={`₹${totalDonations.toLocaleString()}`} label="Total Donations" color="#8B5CF6" />
+              <StatCard icon={<BarChart3 size={36} />} value={resolvedIncidents.length} label="Resolved" color="var(--success)" />
+              <StatCard icon={<Package size={36} />} value={`₹${totalDonations.toLocaleString()}`} label="Total Donations" color="var(--primary)" />
               <StatCard icon={<BarChart3 size={36} />} value={incidents.reduce((s, i) => s + (i.reportCount || 0), 0)} label="Total Reports" />
             </div>
           </div>
@@ -343,7 +378,7 @@ export default function AdminDashboard() {
         {/* COMMAND MAP */}
         {activeTab === 'map' && (
           <div style={{ height: 'calc(100vh - 130px)' }} className="fade-in">
-            <MapView incidents={incidents} interactive={false} userPosition={userPosition} onLocate={locateUser} />
+            <MapView incidents={incidents} ngos={ngos} interactive={false} userPosition={userPosition} onLocate={locateUser} />
           </div>
         )}
 
@@ -351,11 +386,11 @@ export default function AdminDashboard() {
         {activeTab === 'scanner' && (
           <div className="fade-in" style={{ maxWidth: 900, margin: '0 auto', width: '100%' }}>
             {/* Scanner Control Panel */}
-            <div className="card" style={{ padding: '1.5rem', marginBottom: '1.25rem', background: 'linear-gradient(135deg,rgba(109,40,217,0.07),rgba(79,70,229,0.05))', border: '1.5px solid rgba(124,58,237,0.25)' }}>
+            <div className="card" style={{ padding: '1.5rem', marginBottom: '1.25rem', background: 'linear-gradient(135deg,var(--bg-surface),var(--bg-surface))', border: '1.5px solid var(--border)' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', marginBottom: '0.75rem' }}>
-                <Cpu size={22} color="#7C3AED" />
+                <Cpu size={22} color="var(--primary)" />
                 <div>
-                  <h3 style={{ margin: 0, fontSize: '1.05rem', color: '#7C3AED' }}>AI Crisis Scanner</h3>
+                  <h3 style={{ fontFamily: 'var(--font-serif)',  margin: 0, fontSize: '1.05rem', color: 'var(--primary)' }}>AI Crisis Scanner</h3>
                   <p style={{ margin: 0, fontSize: '0.75rem', color: 'var(--text-muted)' }}>Powered by Gemini AI + Google Search • Admin Only</p>
                 </div>
               </div>
@@ -365,21 +400,21 @@ export default function AdminDashboard() {
 
               {/* Live log feed */}
               {scanLog.length > 0 && (
-                <div style={{ background: 'rgba(0,0,0,0.04)', border: '1px solid var(--border-light)', borderRadius: 6, padding: '0.65rem 0.85rem', marginBottom: '0.85rem', maxHeight: 130, overflowY: 'auto', fontFamily: 'monospace' }}>
+                <div style={{ background: 'var(--bg-surface)', border: '1px solid var(--border-light)', borderRadius: 6, padding: '0.65rem 0.85rem', marginBottom: '0.85rem', maxHeight: 130, overflowY: 'auto', fontFamily: 'monospace' }}>
                   {scanLog.map((line, i) => (
-                    <div key={i} style={{ fontSize: '0.72rem', color: '#374151', lineHeight: 1.6 }}>{line}</div>
+                    <div key={i} style={{ fontSize: '0.72rem', color: 'var(--text-body)', lineHeight: 1.6 }}>{line}</div>
                   ))}
                 </div>
               )}
 
               {scanError && (
-                <div style={{ background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.25)', color: 'var(--danger)', borderRadius: 6, padding: '0.55rem 0.8rem', fontSize: '0.78rem', marginBottom: '0.85rem' }}>
+                <div style={{ background: 'var(--danger-light)', border: '1px solid var(--danger)', color: 'var(--danger)', borderRadius: 6, padding: '0.55rem 0.8rem', fontSize: '0.78rem', marginBottom: '0.85rem' }}>
                   ⚠️ {scanError}
                 </div>
               )}
 
               {scanDone && (
-                <div style={{ color: savedCount > 0 ? '#059669' : '#64748B', fontSize: '0.8rem', fontWeight: 600, marginBottom: '0.85rem' }}>
+                <div style={{ color: savedCount > 0 ? 'var(--success)' : 'var(--text-muted)', fontSize: '0.8rem', fontWeight: 600, marginBottom: '0.85rem' }}>
                   {savedCount > 0 ? `✅ ${savedCount} new incidents saved to Firebase and live on map!` : '⚠️ All scanned incidents already exist in Firebase.'}
                 </div>
               )}
@@ -388,10 +423,10 @@ export default function AdminDashboard() {
                 className="btn btn-primary"
                 onClick={handleAIScan}
                 disabled={scanLoading}
-                style={{ background: scanLoading ? undefined : 'linear-gradient(135deg,#7C3AED,#4F46E5)', border: 'none', display: 'inline-flex', alignItems: 'center', gap: '0.5rem', minWidth: 200 }}
+                style={{ background: scanLoading ? undefined : 'linear-gradient(135deg,var(--primary),#4F46E5)', border: 'none', display: 'inline-flex', alignItems: 'center', gap: '0.5rem', minWidth: 200 }}
               >
                 {scanLoading
-                  ? <><span className="spinner" style={{ width: 14, height: 14, borderWidth: 2, borderColor: '#fff', borderTopColor: 'transparent' }} /> Scanning India for crises...</>
+                  ? <><span className="spinner" style={{ width: 14, height: 14, borderWidth: 2, borderColor: 'var(--text-light)', borderTopColor: 'transparent' }} /> Scanning India for crises...</>
                   : <><RefreshCw size={15} /> Run AI Crisis Scan</>}
               </button>
             </div>
@@ -399,22 +434,22 @@ export default function AdminDashboard() {
             {/* Scan Results with Resource Predictions */}
             {scanResults.length > 0 && (
               <div>
-                <h4 style={{ marginBottom: '0.85rem', fontSize: '0.95rem' }}>
+                <h4 style={{ fontFamily: 'var(--font-serif)',  marginBottom: '0.85rem', fontSize: '0.95rem' }}>
                   📊 Scan Results — {scanResults.length} Crisis Reports
-                  <span style={{ marginLeft: 8, fontSize: '0.72rem', background: 'rgba(124,58,237,0.12)', color: '#7C3AED', borderRadius: 4, padding: '2px 7px', fontWeight: 600 }}>🤖 AI Generated</span>
+                  <span style={{ marginLeft: 8, fontSize: '0.72rem', background: 'var(--primary-light)', color: 'var(--primary)', borderRadius: 4, padding: '2px 7px', fontWeight: 600 }}>🤖 AI Generated</span>
                 </h4>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
                   {scanResults.map((inc, idx) => (
-                    <div key={inc._clientId || idx} className="card" style={{ padding: '1.25rem', border: `1.5px solid ${inc.level === 'RED' ? 'rgba(239,68,68,0.3)' : inc.level === 'ORANGE' ? 'rgba(249,115,22,0.3)' : 'rgba(16,185,129,0.25)'}` }}>
+                    <div key={inc._clientId || idx} className="card" style={{ padding: '1.25rem', border: `1.5px solid ${inc.level === 'RED' ? 'var(--danger-light)' : inc.level === 'ORANGE' ? 'var(--warning-light)' : 'var(--success-light)'}` }}>
                       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '0.6rem' }}>
                         <div>
                           <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: 3 }}>
-                            <span style={{ fontSize: '0.65rem', background: inc.level === 'RED' ? '#EF4444' : inc.level === 'ORANGE' ? '#F97316' : '#10B981', color: '#fff', borderRadius: 4, padding: '2px 7px', fontWeight: 700, letterSpacing: '0.05em' }}>{inc.level}</span>
+                            <span style={{ fontSize: '0.65rem', background: inc.level === 'RED' ? 'var(--danger)' : inc.level === 'ORANGE' ? 'var(--warning)' : 'var(--success)', color: 'var(--text-light)', borderRadius: 4, padding: '2px 7px', fontWeight: 700, letterSpacing: '0.05em' }}>{inc.level}</span>
                             <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }}>{inc.disasterType}</span>
                           </div>
-                          <h4 style={{ margin: 0, fontSize: '0.92rem' }}>{inc.title}</h4>
+                          <h4 style={{ fontFamily: 'var(--font-serif)',  margin: 0, fontSize: '0.92rem' }}>{inc.title}</h4>
                         </div>
-                        <span style={{ fontSize: '0.9rem', fontWeight: 800, color: inc.severityScore > 75 ? '#EF4444' : inc.severityScore > 50 ? '#F97316' : '#10B981', whiteSpace: 'nowrap', marginLeft: 12 }}>{inc.severityScore}%</span>
+                        <span style={{ fontSize: '0.9rem', fontWeight: 800, color: inc.severityScore > 75 ? 'var(--danger)' : inc.severityScore > 50 ? 'var(--warning)' : 'var(--success)', whiteSpace: 'nowrap', marginLeft: 12 }}>{inc.severityScore}%</span>
                       </div>
 
                       {inc.description && (
@@ -433,19 +468,19 @@ export default function AdminDashboard() {
 
                       {/* AI Predicted Resource Needs */}
                       <div style={{ background: 'var(--bg-secondary)', border: '1px solid var(--border-light)', borderRadius: 8, padding: '0.85rem' }}>
-                        <h5 style={{ margin: '0 0 0.35rem', fontSize: '0.82rem' }}>AI Predicted Resource Needs</h5>
+                        <h5 style={{ fontFamily: 'var(--font-serif)',  margin: '0 0 0.35rem', fontSize: '0.82rem' }}>AI Predicted Resource Needs</h5>
                         <p style={{ fontSize: '0.74rem', color: 'var(--text-muted)', margin: '0 0 0.4rem', lineHeight: 1.45 }}>
                           {inc.aiAnalysis?.summary || inc.description}
                         </p>
                         <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', marginBottom: '0.55rem' }}>
-                          Urgency: <strong style={{ color: inc.aiAnalysis?.urgency === 'critical' ? '#EF4444' : inc.aiAnalysis?.urgency === 'high' ? '#F97316' : 'inherit' }}>{inc.aiAnalysis?.urgency || 'N/A'}</strong>
+                          Urgency: <strong style={{ color: inc.aiAnalysis?.urgency === 'critical' ? 'var(--danger)' : inc.aiAnalysis?.urgency === 'high' ? 'var(--warning)' : 'inherit' }}>{inc.aiAnalysis?.urgency || 'N/A'}</strong>
                           {' '}&bull; Confidence: <strong>{inc.aiAnalysis?.confidence != null ? `${Math.round(inc.aiAnalysis.confidence * 100)}%` : 'N/A'}</strong>
                         </div>
                         {inc.requiredResources?.length > 0 ? (
                           <div style={{ display: 'flex', flexDirection: 'column', gap: '0.22rem' }}>
                             {inc.requiredResources.map((item, i) => (
                               <div key={i} style={{ fontSize: '0.74rem', color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 4 }}>
-                                <span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: '50%', background: item.priority === 'critical' ? '#EF4444' : item.priority === 'high' ? '#F97316' : item.priority === 'low' ? '#10B981' : '#F59E0B', flexShrink: 0 }} />
+                                <span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: '50%', background: item.priority === 'critical' ? 'var(--danger)' : item.priority === 'high' ? 'var(--warning)' : item.priority === 'low' ? 'var(--success)' : '#F59E0B', flexShrink: 0 }} />
                                 {item.resource}: <strong style={{ color: 'var(--text-primary)', marginLeft: 2 }}>{item.quantity}</strong>
                                 <span style={{ marginLeft: 4, opacity: 0.7 }}>({item.priority})</span>
                               </div>
@@ -465,7 +500,7 @@ export default function AdminDashboard() {
                         )}
                       </div>
 
-                      <div style={{ marginTop: '0.6rem', fontSize: '0.68rem', color: '#94A3B8' }}>
+                      <div style={{ marginTop: '0.6rem', fontSize: '0.68rem', color: 'var(--text-muted)' }}>
                         📍 {inc.location?.lat?.toFixed(4)}, {inc.location?.lng?.toFixed(4)} &bull; Source: {inc.source}
                       </div>
                     </div>
@@ -476,7 +511,7 @@ export default function AdminDashboard() {
 
             {!scanLoading && scanResults.length === 0 && !scanDone && (
               <div className="empty-state">
-                <Cpu size={48} color="#7C3AED" />
+                <Cpu size={48} color="var(--primary)" />
                 <p>Click <strong>Run AI Crisis Scan</strong> to fetch real-time crisis data from Gemini AI.</p>
               </div>
             )}
@@ -487,21 +522,27 @@ export default function AdminDashboard() {
         {activeTab === 'incidents' && (
           <div className="fade-in admin-incidents-layout">
             <div className="admin-incidents-list">
-              <h4 style={{ fontSize: '0.9rem', marginBottom: '0.5rem' }}>Active Incidents ({sortedActiveIncidents.length})</h4>
+              <h4 style={{ fontFamily: 'var(--font-serif)',  fontSize: '0.9rem', marginBottom: '0.5rem' }}>Active Incidents ({sortedActiveIncidents.length})</h4>
               {sortedActiveIncidents.map(inc => {
                 const severity = getModelSeverity(inc);
                 const helpStatus = getIncidentHelpStatus(inc);
+                const etaLabel = getIncidentEtaLabel(inc);
                 return (
-                <div key={inc.id} className={`incident-item ${selectedIncident?.id === inc.id ? 'selected' : ''}`} onClick={() => setSelectedIncident(inc)} style={{ borderLeftColor: severity > 75 ? 'var(--severity-critical)' : severity > 40 ? 'var(--severity-medium)' : 'var(--severity-low)' }}>
+                <div key={inc.id} className={`incident-item ${selectedIncident?.id === inc.id ? 'selected' : ''}`} onClick={() => setSelectedIncident(inc)} style={{ borderLeftColor: severity > 75 ? 'var(--danger)' : severity > 40 ? 'var(--warning)' : 'var(--success)' }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
                     <strong style={{ fontSize: '0.82rem' }}>{inc.title}</strong>
-                    <span style={{ fontSize: '0.72rem', fontWeight: 700, color: severity > 75 ? 'var(--severity-critical)' : 'var(--text-muted)' }}>{severity}%</span>
+                    <span style={{ fontSize: '0.72rem', fontWeight: 700, color: severity > 75 ? 'var(--danger)' : 'var(--text-muted)' }}>{severity}%</span>
                   </div>
                   <SeverityBar value={severity} />
                   <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', marginTop: 4 }}>{inc.disasterType} • {inc.reportCount} reports • {inc.assignedNGOs?.length || 0} NGOs</div>
                   <div style={{ fontSize: '0.7rem', color: helpStatus.color, fontWeight: 700, marginTop: 3 }}>
                     🚑 {helpStatus.label}
                   </div>
+                  {inc.assignedNGOs?.length > 0 && etaLabel && (
+                    <div style={{ fontSize: '0.68rem', color: 'var(--text-muted)', marginTop: 2 }}>
+                      🕒 Predicted ETA: ~{etaLabel}
+                    </div>
+                  )}
                 </div>
                 );
               })}
@@ -513,11 +554,11 @@ export default function AdminDashboard() {
                     const selectedSeverity = getModelSeverity(selectedIncident);
                     return (
                     <>
-                  <h3 style={{ marginBottom: '0.5rem' }}>{selectedIncident.title}</h3>
+                  <h3 style={{ fontFamily: 'var(--font-serif)',  marginBottom: '0.5rem' }}>{selectedIncident.title}</h3>
                   <div style={{ display: 'flex', gap: '1rem', marginBottom: '1rem', flexWrap: 'wrap' }}>
                     <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>🌪 {selectedIncident.disasterType}</span>
                     <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>📢 {selectedIncident.reportCount} reports</span>
-                    <span style={{ fontSize: '0.8rem', fontWeight: 700, color: selectedSeverity > 50 ? 'var(--severity-critical)' : 'var(--severity-low)' }}>Severity: {selectedSeverity}%</span>
+                    <span style={{ fontSize: '0.8rem', fontWeight: 700, color: selectedSeverity > 50 ? 'var(--danger)' : 'var(--success)' }}>Severity: {selectedSeverity}%</span>
                     <span style={{ fontSize: '0.8rem', fontWeight: 700, color: getIncidentHelpStatus(selectedIncident).color }}>🚑 {getIncidentHelpStatus(selectedIncident).label}</span>
                   </div>
                   <SeverityBar value={selectedSeverity} />
@@ -527,7 +568,7 @@ export default function AdminDashboard() {
                   })()}
 
                   <div style={{ marginTop: '1.15rem', marginBottom: '0.4rem', background: 'var(--bg-secondary)', border: '1px solid var(--border-light)', borderRadius: 'var(--radius-sm)', padding: '0.85rem' }}>
-                    <h4 style={{ marginBottom: '0.4rem', fontSize: '0.85rem' }}>AI Predicted Resource Needs</h4>
+                    <h4 style={{ fontFamily: 'var(--font-serif)',  marginBottom: '0.4rem', fontSize: '0.85rem' }}>AI Predicted Resource Needs</h4>
                     <p style={{ fontSize: '0.74rem', color: 'var(--text-muted)', marginBottom: '0.4rem' }}>
                       {selectedIncident.aiAnalysis?.summary || 'No AI summary available yet for this incident.'}
                     </p>
@@ -563,7 +604,7 @@ export default function AdminDashboard() {
                     </div>
                   </div>
 
-                  <h4 style={{ marginTop: '1.5rem', marginBottom: '0.75rem', fontSize: '0.9rem' }}>
+                  <h4 style={{ fontFamily: 'var(--font-serif)',  marginTop: '1.5rem', marginBottom: '0.75rem', fontSize: '0.9rem' }}>
                     Assign NGOs ({selectedIncident.assignedNGOs?.length || 0} assigned)
                   </h4>
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.75rem', marginBottom: '0.6rem', flexWrap: 'wrap' }}>
@@ -589,7 +630,7 @@ export default function AdminDashboard() {
                         style={{ display: 'flex', alignItems: 'center', gap: 6 }}
                       >
                         {autoAssigningIncidentId === selectedIncident.id
-                          ? <><span className="spinner" style={{ width: 10, height: 10, borderWidth: 1.5, borderColor: '#fff', borderTopColor: 'transparent' }} /> Auto assigning...</>
+                          ? <><span className="spinner" style={{ width: 10, height: 10, borderWidth: 1.5, borderColor: 'var(--text-light)', borderTopColor: 'transparent' }} /> Auto assigning...</>
                           : 'Auto Assign (Model)'}
                       </button>
                     </div>
@@ -604,6 +645,7 @@ export default function AdminDashboard() {
                       const assigned = liveIncident.assignedNGOs?.includes(ngo.id);
                       const resolved = liveIncident.resolvedNGOs?.includes(ngo.id);
                       const isAssigning = assigningNgoId === ngo.id;
+                      const etaLabel = estimateEtaFromDistanceKm(ngo.distanceKm);
                       return (
                         <div key={ngo.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0.65rem', background: 'var(--bg-secondary)', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-light)' }}>
                           <div>
@@ -612,6 +654,11 @@ export default function AdminDashboard() {
                             <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}>
                               {ngo.distanceKm != null ? `Distance: ${ngo.distanceKm.toFixed(1)} km` : 'Distance unavailable'} • 📍 {ngo.city || 'N/A'}
                             </div>
+                            {assigned && etaLabel && (
+                              <div style={{ fontSize: '0.68rem', color: 'var(--text-muted)', marginTop: 2 }}>
+                                🕒 Predicted arrival: ~{etaLabel}
+                              </div>
+                            )}
                           </div>
                           {resolved ? (
                             <span style={{ fontSize: '0.72rem', color: 'var(--success)', fontWeight: 600 }}>✅ Resolved</span>
@@ -625,7 +672,7 @@ export default function AdminDashboard() {
                               style={{ display: 'flex', alignItems: 'center', gap: 4 }}
                             >
                               {isAssigning
-                                ? <><span className="spinner" style={{ width: 10, height: 10, borderWidth: 1.5, borderColor: '#fff', borderTopColor: 'transparent' }} /> Assigning...</>
+                                ? <><span className="spinner" style={{ width: 10, height: 10, borderWidth: 1.5, borderColor: 'var(--text-light)', borderTopColor: 'transparent' }} /> Assigning...</>
                                 : 'Assign'}
                             </button>
                           )}
@@ -644,7 +691,7 @@ export default function AdminDashboard() {
         {/* NGOs */}
         {activeTab === 'ngos' && (
           <div className="fade-in">
-            <h3 style={{ marginBottom: '1rem' }}>🏢 Registered NGOs ({ngos.length})</h3>
+            <h3 style={{ fontFamily: 'var(--font-serif)',  marginBottom: '1rem' }}>🏢 Registered NGOs ({ngos.length})</h3>
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: '1rem' }}>
               {ngos.map(ngo => (
                 <div key={ngo.id} className="card" style={{ padding: '1.25rem' }}>
@@ -693,7 +740,7 @@ export default function AdminDashboard() {
         {/* VOLUNTEERS */}
         {activeTab === 'volunteers' && (
           <div className="fade-in">
-            <h3 style={{ marginBottom: '1rem' }}>👥 All Volunteers ({allVolunteers.length})</h3>
+            <h3 style={{ fontFamily: 'var(--font-serif)',  marginBottom: '1rem' }}>👥 All Volunteers ({allVolunteers.length})</h3>
             <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
               {volunteerGroups.map((group) => (
                 <div key={group.id} className="card" style={{ padding: '1rem' }}>
